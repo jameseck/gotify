@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"github.com/ceph/go-ceph/rados"
 	"github.com/ceph/go-ceph/rbd"
-	"github.com/fsnotify/fsnotify"
+	//	"github.com/fsnotify/fsnotify"
 	"log"
 	"os/exec"
 	"sync"
@@ -13,18 +13,23 @@ import (
 )
 
 var (
-	state = make(map[string]time.Time)
 	mutex = &sync.Mutex{}
 )
 
 type Rbd struct {
-	Pool     string `json:"pool"`
-	Name     string `json:"name"`
-	Snap     string `json:"snap"`
-	Device   string `json:"device"`
-	Since    time.Time
-	Locks    []rbd.Locker
-	Watchers []Watcher
+	Name        string
+	Pool        string
+	Map         RbdMap
+	MappedSince time.Time
+	Locks       []rbd.Locker
+	Watchers    []Watcher
+}
+
+type RbdMap struct {
+	Name   string `json:"name"`
+	Pool   string `json:"pool"`
+	Snap   string `json:"snap"`
+	Device string `json:"device"`
 }
 
 // {"watchers":{"watcher":{"address":"192.168.3.2:0\/654154289","client":8937,"cookie":2}}}
@@ -44,32 +49,42 @@ type Watcher struct {
 }
 
 func (rbd *Rbd) Duration() time.Duration {
-	return time.Now().Sub(rbd.Since)
+	return time.Now().Sub(rbd.MappedSince)
 }
 
-func Locks(maps map[string]Rbd) {
-	fmt.Printf("Entering Locks func\n")
+func Locks(maps map[string]Rbd) map[string]Rbd {
+	fmt.Println("Entering Locks func")
 
-	conn, _ := rados.NewConnWithUser("osrbd")
+	conn, _ := rados.NewConn()
 	conn.ReadDefaultConfigFile()
 	conn.Connect()
 	iocx, err := conn.OpenIOContext("rbd")
 	if err != nil {
-		fmt.Println("Locks error: %s", err)
+		fmt.Println("Locks error opening iocontext: ", err)
 	}
+	log.Printf("maps: %-v\n", maps)
 
-	log.Printf("Getting rbd names\n")
+	log.Println("Getting rbd names")
 	names, err := rbd.GetImageNames(iocx)
 	if err != nil {
-		fmt.Println("Locks error: %s", err)
+		fmt.Println("Locks error getting image names: ", err)
 	}
 
 	for i := range names {
+		// populate maps with image names
+		var r Rbd
+		r.Name = names[i]
+		r.Pool = "rbd"
+		maps[names[i]] = r
+
+		fmt.Println("Getting rbd image: ", names[i])
 		img := rbd.GetImage(iocx, names[i])
-		img.Open(false)
+		fmt.Println("Opening rbd image: ", names[i])
+		img.Open(false) // false = read-only
+		fmt.Println("ListLockers on rbd image: ", names[i])
 		_, lockers, err := img.ListLockers()
 		if err != nil {
-			fmt.Printf("Locks error: %s\n", err)
+			fmt.Printf("Error listing lockers for %s: %s\n", err, names[i])
 		}
 		for k := range lockers {
 			fmt.Printf("Image %s is locked by %s\n", names[i], lockers[k])
@@ -80,23 +95,23 @@ func Locks(maps map[string]Rbd) {
 				maps[names[i]] = r
 			}
 		}
+		fmt.Println("Closing rbd image: ", names[i])
 		img.Close()
-		// add watchers to rbd type
-		log.Printf("looking for watchers on %s\n", maps[names[i]])
-		if r, exists := maps[names[i]]; exists {
-			log.Printf("looking for watchers on %s\n", names[i])
-			w := Listwatchers(r)
-			rw := r.Watchers
-			for ww := range w {
-				log.Printf("Found watcher on rbd %s\n", names[i])
-				rw = append(rw, rw[ww])
-			}
-			r.Watchers = rw
-			maps[names[i]] = r
-		}
-	}
-	log.Printf("Finished Locks func\n")
 
+		log.Printf("looking for watchers on %s\n", names[i])
+		r = maps[names[i]]
+		w := Listwatchers(r)
+		rw := r.Watchers
+		for ww := range w {
+			log.Printf("Found watcher on rbd %s\n", names[i])
+			rw = append(rw, rw[ww])
+		}
+		r.Watchers = rw
+		maps[names[i]] = r
+	}
+
+	log.Printf("Finished Locks func\n")
+	return maps
 }
 
 // Pass an Rbd and receive a slice of watchers
@@ -126,9 +141,9 @@ func Listwatchers(rbd Rbd) []Watcher {
 	return watchers
 }
 
-func Showmapped() map[string]Rbd {
+func Showmapped(rbds map[string]Rbd) map[string]Rbd {
 
-	maps := make(map[string]Rbd)
+	var maps []RbdMap
 
 	out, err := exec.Command("/usr/bin/rbd", "showmapped", "--format", "json").Output()
 	if err != nil {
@@ -140,67 +155,67 @@ func Showmapped() map[string]Rbd {
 		log.Fatal(err)
 	}
 	for k, _ := range maps {
-		r := maps[k]
-		r.Since = time.Now()
-
-		maps[k] = r
+		r := rbds[maps[k].Name]
+		r.MappedSince = time.Now()
+		rbds[maps[k].Name] = r
 	}
-	return maps
+	return rbds
 }
 
 func main() {
 
 	mutex.Lock()
-	rbdmaps := Showmapped()
-	Locks(rbdmaps)
+	rbdmaps := make(map[string]Rbd)
+	rbdmaps = Showmapped(rbdmaps)
+	rbdmaps = Locks(rbdmaps)
 	mutex.Unlock()
 
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer watcher.Close()
+	// 	watcher, err := fsnotify.NewWatcher()
+	// 	if err != nil {
+	// 		log.Fatal(err)
+	// 	}
+	// 	defer watcher.Close()
 
-	ticker := time.NewTicker(time.Millisecond * 2000)
-	go func() {
-		for t := range ticker.C {
-			fmt.Println("Tick at", t)
-			mutex.Lock()
-			for _, v := range rbdmaps {
-				fmt.Printf("%v: mapped for: %v\n", v.Name, v.Duration())
-			}
-			mutex.Unlock()
-		}
-	}()
+	//	ticker := time.NewTicker(time.Millisecond * 2000)
+	//	go func() {
+	//		for t := range ticker.C {
+	//			fmt.Printf("Tick at", t)
+	//			mutex.Lock()
+	//			for _, v := range rbdmaps {
+	//				fmt.Printf("%v: mapped for: %v\n", v.Name, v.Duration())
+	//			}
+	//			mutex.Unlock()
+	//		}
+	//	}()
 
-	done := make(chan bool)
-	go func() {
-		for {
-			select {
-			case event := <-watcher.Events:
-				switch event.Op {
-				case fsnotify.Create:
-					mutex.Lock()
-					m := rbdmaps[event.Name]
-					m.Since = time.Now()
-					rbdmaps[event.Name] = m
-					mutex.Unlock()
-					log.Printf("Create %s detected", event.Name)
-				case fsnotify.Remove:
-					mutex.Lock()
-					delete(rbdmaps, event.Name)
-					mutex.Unlock()
-					log.Printf("Remove %s detected", event.Name)
-				}
-			case err := <-watcher.Errors:
-				log.Println("error:", err)
-			}
-		}
-	}()
+	// 	done := make(chan bool)
+	// 	go func() {
+	// 		for {
+	// 			select {
+	// 			case event := <-watcher.Events:
+	// 				switch event.Op {
+	// 				case fsnotify.Create:
+	// 					mutex.Lock()
+	// 					m := rbdmaps[event.Name]
+	// 					m.MappedSince = time.Now()
+	// 					rbdmaps[event.Name] = m
+	// 					mutex.Unlock()
+	// 					log.Printf("Create %s detected", event.Name)
+	// 				case fsnotify.Remove:
+	// 					mutex.Lock()
+	// 					delete(rbdmaps, event.Name)
+	// 					mutex.Unlock()
+	// 					log.Printf("Remove %s detected", event.Name)
+	// 				}
+	// 			case err := <-watcher.Errors:
+	// 				log.Println("error:", err)
+	// 			}
+	// 		}
+	// 	}()
 
-	err = watcher.Add("/dev/rbd/rbd")
-	if err != nil {
-		log.Fatal(err)
-	}
-	<-done
+	// 	err = watcher.Add("/dev/rbd/rbd")
+	// 	if err != nil {
+	// 		log.Fatal(err)
+	// 	}
+	// 	<-done
 }
